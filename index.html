@@ -43,11 +43,16 @@
   canvas { position: absolute; inset: 0; display: block; }
   .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 
+  /* Overlays never swallow a tap. The panels opt back in, so "tap anywhere to
+     retry" still works, but the intro stays transparent: the first tap has to
+     reach the canvas or the game simply never starts. That was the bug. */
   .layer {
-    position: absolute; inset: 0; display: none;
+    position: absolute; inset: 0; display: none; pointer-events: none;
     align-items: center; justify-content: center; flex-direction: column;
     background: rgba(8, 11, 15, .82); text-align: center; padding: 24px;
   }
+  .panel { pointer-events: auto; }
+  #intro .panel { pointer-events: none; }
   .layer.on { display: flex; }
   #hud.layer { background: none; pointer-events: none; display: none;
                align-items: flex-start; justify-content: flex-start; }
@@ -66,6 +71,7 @@
           font-size: 11px; letter-spacing: .18em; color: rgba(136,153,168,.5); }
 
   .panel { max-width: 340px; }
+
   h1 { font-size: clamp(30px, 9vw, 46px); margin: 0 0 6px; letter-spacing: -.01em; }
   .tagline { color: var(--ink-dim); font-size: 14px; letter-spacing: .06em; display: block; margin-bottom: 22px; }
   .over-label { display: block; font-size: 13px; letter-spacing: .2em;
@@ -86,6 +92,11 @@
   #corner { position: absolute; right: 14px; bottom: max(16px, env(safe-area-inset-bottom));
             display: flex; gap: 8px; z-index: 5; }
   #corner.hide-pause #btnPause { display: none; }
+  /* Capture mode: canvas only, no chrome. tools/cargo-clips.mjs turns this on
+     to record ad footage from real play rather than a mock-up. */
+  body.capture #hud, body.capture #corner, body.capture #over,
+  body.capture #intro, body.capture #paused { display: none !important; }
+
   .icon { width: 34px; height: 34px; display: grid; place-items: center; cursor: pointer;
           border: 1px solid rgba(136,153,168,.26); border-radius: 2px;
           background: rgba(8,11,15,.5); color: var(--ink-dim); font-size: 14px; }
@@ -121,6 +132,8 @@
       <span id="finalBest" hidden></span>
       <span class="best-flag" id="bestFlag">New record</span>
       <button class="tapline" id="again">Tap anywhere to retry</button>
+      <!-- Playable-ad call to action. Hidden in every other build. -->
+      <button class="btn" id="cta" style="display:none">Play free</button>
       <button class="btn ghost" id="revive">Free &plus;1 pad &mdash; keep going</button>
     </div>
   </div>
@@ -1161,8 +1174,12 @@ const PAINT = { R:'#E2574C', B:'#3E8FD8', G:'#46B06B', Y:'#EFC03A', P:'#9A6BD8' 
    VARIANT — ?v=A|B|C, then sticky, so a tester keeps the same game
    ========================================================= */
 
+// A playable ad is not a playtest: one variant, one level, one end card.
+const PLAYABLE = BUILD.playable === true;
+const PLAYABLE_LEVEL = 3;                // "Flip it" — the board that teaches the switch
+
 const qs = new URLSearchParams(location.search);
-const asked = (qs.get('v') || '').toUpperCase();
+const asked = PLAYABLE ? 'B' : (qs.get('v') || '').toUpperCase();
 let VARIANT = ['A','B','C'].includes(asked) ? asked : (store('cargo.variant') || '');
 if (!VARIANT) {
   // No assignment yet and none asked for: split testers evenly at random. This
@@ -1173,10 +1190,12 @@ store('cargo.variant', VARIANT);
 const SET = LEVEL_SETS[VARIANT];
 const PROGRESS_KEY = 'cargo.level.' + VARIANT;
 
-let levelIdx = clamp(parseInt(store(PROGRESS_KEY) || '0', 10) || 0, 0, SET.length - 1);
+let levelIdx = PLAYABLE ? PLAYABLE_LEVEL
+  : clamp(parseInt(store(PROGRESS_KEY) || '0', 10) || 0, 0, SET.length - 1);
 let sim = simCreate(SET[levelIdx]);
 let acc = 0;                             // seconds of game time not yet ticked
 let padBonus = 0;                        // pads granted by a rewarded continue
+let replay = null, finalSim = null;      // Jam Replay: the rewind after a fail
 let seenDelivered = 0, seenTick = 0;
 const pop = new Map();                   // bay slot -> remaining pop seconds
 
@@ -1493,6 +1512,10 @@ function drawTransit() {
   for (const c of sim.transit) {
     const p = slotPt(c.lane, c.slot, frac);
     drawCrate(p.x, p.y, c.color, CRATE - 2);
+    if (replay && c.id === replay.crate) {
+      ctx.strokeStyle = '#E4645A'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(p.x, p.y, CRATE, 0, TAU); ctx.stroke();
+    }
   }
 }
 
@@ -1511,9 +1534,17 @@ function drawFx() {
 
 function padsLeft() { return sim.dock.filter(p => !p).length; }
 
+// The level as it is actually being played, pads included. The solver, the
+// replay and the game all have to agree on this or a rewind drifts.
+function levelCfg() {
+  const lvl = SET[levelIdx];
+  return padBonus ? Object.assign({}, lvl, { pads: lvl.pads + padBonus }) : lvl;
+}
+
 function loadLevel(retryOfSame) {
   const lvl = SET[levelIdx];
-  sim = simCreate(padBonus ? Object.assign({}, lvl, { pads: lvl.pads + padBonus }) : lvl);
+  replay = null; finalSim = null;
+  sim = simCreate(levelCfg());
   acc = 0; seenDelivered = 0; seenTick = 0; pop.clear();
   el('levelName').textContent = (levelIdx + 1) + '. ' + lvl.name;
   el('vtag').textContent = 'VARIANT ' + VARIANT;
@@ -1559,7 +1590,12 @@ Object.assign(G, {
   },
 
   idle() {},                     // the board is already drawn; nothing to animate yet
-  dead() {},
+  // Run the rewind in slow motion while the panel waits.
+  dead(dt) {
+    if (!replay || sim.tick >= replay.to) return;
+    replay.acc += dt * 0.9;
+    while (replay.acc >= 1/20 && sim.tick < replay.to) { replay.acc -= 1/20; simTick(sim); }
+  },
   wake() {}, hush() {},          // no continuous audio in the prototype
 
   step(dt) {
@@ -1610,24 +1646,48 @@ Object.assign(G, {
     drawLoader();
     drawYard();
     drawFx();
+    if (replay) {
+      ctx.fillStyle = '#E4645A';
+      ctx.font = '700 20px ui-monospace, Menlo, monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('JAM REPLAY', W/2, 150);
+      ctx.fillStyle = 'rgba(232,238,243,.55)';
+      ctx.font = '600 14px ui-monospace, Menlo, monospace';
+      ctx.fillText('this one had nowhere to go', W/2, 178);
+    }
     ctx.restore();
   },
 
   crash(cause) {
     if (cause === 'Jam') {
       run.shake = 0.9; haptic([20, 40, 90]);
-      const jam = sim.dock[sim.dock.length - 1];
       const r = padRect(sim.dock.length - 1);
       burst(r.x + r.w/2, r.y + r.h/2, 14, { color: '#E4645A', maxSpeed: 190, maxLife: .5 });
-      if (jam) {} // the crate that filled the pad is sim.jamCrate; Jam Replay uses it next step
+
+      // Jam Replay. The command log plus a deterministic sim means a rewind is
+      // just a shorter replay, so this costs nothing to compute and is the one
+      // thing that can make a fail feel like the player's own mistake rather
+      // than bad luck. crash() runs before the kernel schedules the game-over
+      // panel, so widening overDelay here holds the screen for it.
+      finalSim = sim;
+      const from = Math.max(0, sim.tick - 44);            // about two seconds
+      replay = { to: sim.tick, crate: sim.jamCrate, acc: 0, from };
+      sim = simReplay(levelCfg(), finalSim.log, from);
+      // 44 ticks at 0.9x is about 2.4 s of rewind; the panel waits just past
+      // it. Any slower and the retry stops feeling instant, which is the one
+      // thing this genre cannot afford to lose.
+      G.overDelay = 2600;
+      ev('jam_replay_shown', { from, to: replay.to });
     } else {
       haptic(20);
       burst(W/2, 510, 18, { color: '#59C08A', maxSpeed: 220, maxLife: .6 });
+      G.overDelay = 900;
     }
   },
 
   // A win advances; a jam repeats the same level. Progress is per variant.
   record() {
+    if (PLAYABLE) return false;          // an ad has one level and never advances
     if (run.cause === 'Dispatched' && levelIdx < SET.length - 1) {
       levelIdx++; store(PROGRESS_KEY, String(levelIdx));
     }
@@ -1636,19 +1696,29 @@ Object.assign(G, {
 
   overPanel() {
     const won = run.cause === 'Dispatched';
+    const end = finalSim || sim;
     ev(won ? 'level_complete' : 'level_fail', {
       s: +((performance.now() - levelStarted) / 1000).toFixed(1),
-      taps: sim.log.length,
-      releases: sim.released, flips: sim.flips, resends: sim.resends,
-      pads_left: padsLeft(), delivered: sim.delivered,
+      taps: end.log.length,
+      releases: end.released, flips: end.flips, resends: end.resends,
+      pads_left: end.dock.filter(p => !p).length, delivered: end.delivered,
       fail_reason: won ? null : 'dock_full'
     });
     if (!won) { lastFailAt = performance.now(); offerShown = true; ev('offer_shown', { offer: 'free_pad' }); }
     el('overLabel').textContent = won ? 'Dispatched' : 'Jam';
-    el('finalTrucks').textContent = sim.delivered;
-    el('finalTaps').textContent = sim.log.length;
-    el('finalPads').textContent = padsLeft();
+    el('finalTrucks').textContent = end.delivered;
+    el('finalTaps').textContent = end.log.length;
+    el('finalPads').textContent = end.dock.filter(p => !p).length;
     el('finalLevel').textContent = levelIdx + 1;
+    if (PLAYABLE) {
+      el('overLabel').textContent = won ? 'Loaded.' : 'Jammed.';
+      el('finalTrucks').textContent = 'CARGO LOOP';
+      el('finalTrucks').style.fontSize = '26px';
+      el('again').textContent = won ? 'Tap to play the rest' : 'Tap to try again';
+      el('cta').style.display = 'block';
+      el('revive').style.display = 'none';
+      return;
+    }
     el('again').textContent = won ? 'Tap anywhere for the next level' : 'Tap anywhere to retry';
     // The kernel writes "Continue — watch ad" at boot. There are no ads here:
     // this button is the booster-demand proxy, so it says what it does.
@@ -1659,19 +1729,32 @@ Object.assign(G, {
   // one more pad, same board, carry on from where it jammed.
   revive() {
     if (offerShown) ev('offer_taken', { offer: 'free_pad' });
+    const keep = (finalSim || sim).log.slice();
+    replay = null; finalSim = null;
     padBonus++;
-    const keep = sim.log.slice();
-    const lvl = SET[levelIdx];
-    sim = simCreate(Object.assign({}, lvl, { pads: lvl.pads + padBonus }));
+    sim = simCreate(levelCfg());
     for (const c of keep) { while (sim.tick < c.tick) simTick(sim); simCmd(sim, c.type, c.target); }
     acc = 0;
   }
+});
+
+// The one thing a playable ad must do: hand the tap to whatever is hosting it.
+// Networks differ, so try MRAID, then the plain link, and never throw.
+el('cta').addEventListener('click', e => {
+  e.preventDefault(); e.stopPropagation();
+  const url = 'https://iqbalopu.github.io/loop-proto/';
+  try {
+    if (window.mraid && typeof window.mraid.open === 'function') { window.mraid.open(url); return; }
+    if (typeof window.FbPlayableAd === 'object' && window.FbPlayableAd.onCTAClick) { window.FbPlayableAd.onCTAClick(); return; }
+    window.open(url, '_blank');
+  } catch (err) { /* a dead host must not break the ad */ }
 });
 
 /* @dev-only */
 window.__cargo = {
   sim: () => sim, SIM, variant: VARIANT, levels: SET,
   log: () => LOG, dump: dumpLog,
+  clean: on => document.body.classList.toggle('capture', on !== false),
   goto(i) { levelIdx = clamp(i, 0, SET.length - 1); store(PROGRESS_KEY, String(levelIdx)); startRun(); },
   cmd: (type, target) => simCmd(sim, type, target),
   replay: () => simReplay(SET[levelIdx], sim.log)
